@@ -1,0 +1,684 @@
+#!/bin/bash
+#==============================================================================
+# vm-init - post-install setup for a fresh Ubuntu or Debian VM.
+#
+# Detects the system, asks what to do, then does it: updates and base tools,
+# automatic security updates, the QEMU guest agent, an SMB share mounted at
+# boot, IPv6 off, the root volume extended, SSH hardened. Every step can be
+# declined, and nothing secret lives in this file.
+#
+#   vm-init                               interactive
+#   vm-init --status                      read only
+#   vm-init --share //nas/media --no-ipv6 --yes
+#   NAS_USER=bob NAS_PASS=... vm-init --share //nas/media
+#
+# https://github.com/Lousblue/vm-init                              MIT licence
+#==============================================================================
+set -Eeuo pipefail
+
+LOG='/var/log/vm-init.log'
+APT_CONF='/etc/apt/apt.conf.d/20auto-upgrades'
+SYSCTL_CONF='/etc/sysctl.d/99-vm-init-ipv6.conf'
+NETPLAN_CONF='/etc/netplan/99-vm-init-ipv6.yaml'
+# Sorted before 50-cloud-init.conf on purpose: sshd keeps the first value it
+# reads, and cloud images ship a drop-in that turns password login back on.
+SSHD_CONF='/etc/ssh/sshd_config.d/10-vm-init.conf'
+AGENT_DEV='/dev/virtio-ports/org.qemu.guest_agent.0'
+BASE_PKGS=(curl wget git nano htop tree ca-certificates gnupg iputils-ping)
+
+#--- Output -------------------------------------------------------------------
+if [ -t 1 ]; then
+  TTY=1
+  R=$'\033[0m'; B=$'\033[1m'; D=$'\033[2m'
+  C=$'\033[36m'; G=$'\033[32m'; Y=$'\033[33m'; E=$'\033[31m'
+else
+  TTY=0
+  R=; B=; D=; C=; G=; Y=; E=
+fi
+SPIN=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+
+# Blocks: System, Questions, To apply, Done.
+title() { printf '\n%s%s%s\n' "$B" "$1" "$R"; }
+kv()    { printf '  %-13s %s\n' "$1" "$2"; }
+note()  { printf '  %s%s%s\n' "$D" "$1" "$R"; }
+warn()  { printf '  %s!%s %s\n' "$Y" "$R" "$1" >&2; }
+die()   { printf '%serror:%s %s\n' "$E" "$R" "$1" >&2; exit 1; }
+
+# Steps: a framed box per step while applying, with a running log.
+STEP=0; TOTAL=0; WARNINGS=0; CURRENT=''
+log()   { [ -n "${LOG_READY:-}" ] && printf '%s\n' "$1" >>"$LOG"; return 0; }
+step()  { STEP=$((STEP + 1)); CURRENT="$1"
+          printf '\n%s┌─ [%d/%d] %s%s  %s%s%s\n' "$C" "$STEP" "$TOTAL" "$1" "$R" "$D" "$(date +%H:%M:%S)" "$R"
+          log ""; log "=== [$STEP/$TOTAL] $1  $(date '+%F %T')"; }
+info()  { printf '%s│%s  %s\n' "$C" "$R" "$1"; log "    $1"; }
+tick()  { printf '%s│%s  %s✓%s %s\n' "$C" "$R" "$G" "$R" "$1"; }
+flag()  { printf '%s│%s  %s!%s %s\n' "$C" "$R" "$Y" "$R" "$1"; log "    WARNING $1"; WARNINGS=$((WARNINGS + 1)); }
+ok()    { printf '%s└─%s %s✓%s %s\n' "$C" "$R" "$G" "$R" "$1"; log "    OK $1"; }
+stop()  { printf '%s└─%s %s!%s %s\n' "$C" "$R" "$Y" "$R" "$1"; log "    WARNING $1"; WARNINGS=$((WARNINGS + 1)); }
+
+gb()     { awk -v v="${1:-0}" 'BEGIN { printf "%d", v }'; }
+plural() { if [ "$1" = 1 ]; then echo "1 $2"; else echo "$1 ${3:-${2}s}"; fi; }
+duration() { if [ "$1" -ge 60 ]; then echo "$(($1 / 60)) min $(($1 % 60)) s"; else echo "$1 s"; fi; }
+
+# Runs a command with its output in the log and a spinner on the terminal.
+busy() {   # busy <label> <command...>
+  local label="$1" pid i=0; shift
+  if [ "$TTY" = 0 ]; then "$@" >>"$LOG" 2>&1; return; fi
+  "$@" >>"$LOG" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    printf '\r\033[K%s│%s  %s%s%s %s' "$C" "$R" "$C" "${SPIN[i]}" "$R" "$label"
+    i=$(( (i + 1) % ${#SPIN[@]} )); sleep 0.1
+  done
+  printf '\r\033[K'
+  wait "$pid"
+}
+
+#--- Help ---------------------------------------------------------------------
+usage() {
+  cat <<EOF
+vm-init - post-install setup for a fresh Ubuntu or Debian VM.
+
+usage: vm-init [options]
+
+  Run with no options on a terminal and it asks what to do, showing what it
+  detected. Pass any option and it applies without asking; what you did not
+  mention takes its default.
+
+steps and their defaults
+  --no-update          skip the system update and the base tools   (default: do it)
+  --no-auto-updates    do not enable unattended security updates   (default: enable)
+  --user NAME          owner of /srv and /opt                      (default: who ran sudo)
+  --no-owner           leave /srv and /opt alone
+  --share //SRV/NAME   SMB share to mount at every boot            (default: none)
+  --mount PATH         where to mount it                           (default: /mnt/NAME)
+  --read-only          mount the share read-only
+  --no-ipv6            disable IPv6                                (default: keep it)
+  --no-extend          do not grow the root volume over free space (default: grow it)
+  --harden-ssh         no root login, no password login when a key is present
+  --no-harden-ssh      leave sshd as it is                         (default: harden)
+
+other
+  --status             show what was detected, change nothing
+  --dry-run            show what would be done, then stop
+  --yes, -y            never ask, take every default
+  --help, -h           this text
+
+The share password is read from NAS_USER and NAS_PASS in the environment.
+Without them the script asks, with the password hidden; without a terminal
+it stops. The guest agent is not a question: when the hypervisor exposes the
+channel, it is installed and started.
+EOF
+}
+
+#--- Arguments ----------------------------------------------------------------
+MODE='apply'
+ASSUME_YES=0
+DRY_RUN=0
+GIVEN=0
+DO_UPDATE=yes
+DO_AUTO=yes
+# The human behind this run: whoever ran sudo, else whoever runs the script.
+ME="${SUDO_USER:-$(id -un)}"
+OWNER=''; [ "$ME" != root ] && OWNER="$ME"
+SHARE=''
+MOUNT=''
+SHARE_RO=no
+DO_IPV6=no          # yes means: disable it
+DO_EXTEND=yes
+DO_HARDEN=yes
+
+need_arg() { [ -n "${2:-}" ] || die "$1 needs a value"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status)          MODE='status' ;;
+    --help|-h)         usage; exit 0 ;;
+    --yes|-y)          ASSUME_YES=1 ;;
+    --dry-run)         DRY_RUN=1 ;;
+    --no-update)       DO_UPDATE=no;  GIVEN=1 ;;
+    --no-auto-updates) DO_AUTO=no;    GIVEN=1 ;;
+    --user)            need_arg "$@"; OWNER="$2"; GIVEN=1; shift ;;
+    --no-owner)        OWNER='';      GIVEN=1 ;;
+    --share)           need_arg "$@"; SHARE="$2"; GIVEN=1; shift ;;
+    --mount)           need_arg "$@"; MOUNT="$2"; GIVEN=1; shift ;;
+    --read-only)       SHARE_RO=yes;  GIVEN=1 ;;
+    --no-ipv6)         DO_IPV6=yes;   GIVEN=1 ;;
+    --no-extend)       DO_EXTEND=no;  GIVEN=1 ;;
+    --harden-ssh)      DO_HARDEN=yes; GIVEN=1 ;;
+    --no-harden-ssh)   DO_HARDEN=no;  GIVEN=1 ;;
+    *) printf 'unknown option: %s\n\n' "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -z "$MOUNT" ] || [ -n "$SHARE" ] || die '--mount needs --share'
+[ "$SHARE_RO" = no ] || [ -n "$SHARE" ] || die '--read-only needs --share'
+
+#--- Privileges ---------------------------------------------------------------
+command -v apt-get >/dev/null || die 'this script is for Debian and Ubuntu (apt-get not found)'
+if [ "$(id -u)" = 0 ]; then
+  SUDO=''
+else
+  command -v sudo >/dev/null || die 'run as root, or install sudo'
+  SUDO='sudo'
+  sudo -v || die 'sudo is required'
+fi
+
+#--- Detection ----------------------------------------------------------------
+# shellcheck disable=SC1091  # the file is the system's, not ours
+os_name() { ( . /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-unknown}" ); }
+
+IFACE="$(ip -o route show default 2>/dev/null | awk '{ print $5; exit }' || true)"
+VIRT="$(systemd-detect-virt 2>/dev/null || true)"; VIRT="${VIRT:-none}"
+
+AGENT_CHANNEL=0; [ -e "$AGENT_DEV" ] && AGENT_CHANNEL=1
+agent_state() {
+  command -v qemu-ga >/dev/null 2>&1 || { echo 'not installed'; return; }
+  local s; s="$(systemctl is-active qemu-guest-agent 2>/dev/null || true)"
+  case "$s" in active) echo running ;; *) echo 'installed, not running' ;; esac
+}
+hypervisor_line() {
+  case "$VIRT" in
+    kvm|qemu)
+      if [ "$AGENT_CHANNEL" = 1 ]; then echo "QEMU/KVM, guest agent $(agent_state)"
+      else echo 'QEMU/KVM, no guest agent channel'; fi ;;
+    none) echo 'none detected' ;;
+    *)    echo "$VIRT" ;;
+  esac
+}
+
+# The root volume: an LVM logical volume, or not. Sizes in whole GB.
+LV_PATH=''; LV_VG=''; LV_SIZE=0; VG_FREE=0
+ROOT_SRC="$(findmnt -no SOURCE / 2>/dev/null || true)"
+if [ -n "$ROOT_SRC" ] && command -v lvs >/dev/null 2>&1; then
+  read -r LV_PATH LV_VG LV_SIZE < <($SUDO lvs --noheadings --nosuffix --units g \
+    -o lv_path,vg_name,lv_size "$ROOT_SRC" 2>/dev/null) || true
+  if [ -n "$LV_PATH" ]; then
+    VG_FREE="$($SUDO vgs --noheadings --nosuffix --units g -o vg_free "$LV_VG" 2>/dev/null | tr -d ' ')"
+  fi
+  LV_SIZE="$(gb "$LV_SIZE")"; VG_FREE="$(gb "$VG_FREE")"
+fi
+root_line() {
+  if [ -z "$LV_PATH" ]; then echo "${ROOT_SRC:-unknown}, not LVM"
+  elif [ "$VG_FREE" -gt 0 ]; then echo "$LV_PATH ${LV_SIZE} GB, ${VG_FREE} GB free in the volume group"
+  else echo "$LV_PATH ${LV_SIZE} GB, volume group full"; fi
+}
+
+ipv6_disabled() { [ "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)" = 1 ]; }
+ipv6_line() {
+  if ipv6_disabled; then echo disabled
+  elif [ -n "$IFACE" ]; then echo "enabled on $IFACE"
+  else echo enabled; fi
+}
+
+# SSH. The person to protect is whoever is actually logging in.
+SSHD=0; command -v sshd >/dev/null 2>&1 && SSHD=1
+KEY_USER="$ME"
+KEY_HOME="$(getent passwd "$KEY_USER" 2>/dev/null | cut -d: -f6)"
+HAS_KEY=0
+if [ -n "$KEY_HOME" ] && $SUDO test -s "$KEY_HOME/.ssh/authorized_keys" 2>/dev/null; then HAS_KEY=1; fi
+# sshd refuses to even read its config without its privilege separation
+# directory, which only exists once the service has started at least once.
+sshd_opt() {
+  [ -d /run/sshd ] || $SUDO mkdir -p /run/sshd 2>/dev/null || true
+  # Captured first, not piped: awk stopping early would hand sshd a SIGPIPE,
+  # which pipefail reports as a failure.
+  local out; out="$($SUDO sshd -T 2>/dev/null || true)"
+  awk -v k="$1" '$1 == k { print $2; exit }' <<<"$out"
+}
+ssh_line() {
+  [ "$SSHD" = 1 ] || { echo 'not installed'; return; }
+  local r p k
+  r="$(sshd_opt permitrootlogin)"; p="$(sshd_opt passwordauthentication)"
+  case "$r" in
+    yes) r='allowed' ;; no) r='off' ;;
+    prohibit-password|without-password) r='key only' ;;
+    *) r='unknown' ;;
+  esac
+  case "$p" in yes) p='allowed' ;; no) p='off' ;; *) p='unknown' ;; esac
+  if [ "$HAS_KEY" = 1 ]; then k="key present for $KEY_USER"; else k="no key for $KEY_USER"; fi
+  echo "root login $r, password login $p, $k"
+}
+
+shares_line() {
+  local out
+  out="$(findmnt -rn -t cifs -o SOURCE,TARGET,OPTIONS 2>/dev/null \
+        | awk '{ m = ($3 ~ /(^|,)ro(,|$)/) ? "read-only" : "read-write"; print $1 " on " $2 ", " m }')"
+  echo "${out:-none mounted}"
+}
+
+show_system() {
+  title 'System'
+  kv os            "$(os_name)"
+  kv kernel        "$(uname -r)"
+  kv hypervisor    "$(hypervisor_line)"
+  kv 'root volume' "$(root_line)"
+  kv ipv6          "$(ipv6_line)"
+  kv ssh           "$(ssh_line)"
+  kv shares        "$(shares_line)"
+  [ -f /var/run/reboot-required ] && kv reboot 'required'
+  return 0
+}
+
+if [ "$MODE" = status ]; then show_system; echo; exit 0; fi
+
+#--- Helpers for the plan -----------------------------------------------------
+# //server/name[/sub] -> SHARE_SERVER, SHARE_NAME, SHARE_SLUG
+parse_share() {
+  local s="${1%/}" rest
+  case "$s" in //*/*) ;; *) return 1 ;; esac
+  rest="${s#//}"
+  SHARE_SERVER="${rest%%/*}"; SHARE_NAME="${rest#*/}"
+  [ -n "$SHARE_SERVER" ] && [ -n "$SHARE_NAME" ] || return 1
+  SHARE="$s"
+  SHARE_SLUG="$(printf '%s' "${SHARE_NAME##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9\n' '-')"
+}
+
+# What hardening can safely do. Never lock out the person running this.
+plan_ssh() {
+  SSH_ROOT=''; SSH_PASS=''; SSH_WHY=''
+  if [ "$KEY_USER" = root ]; then
+    if [ "$HAS_KEY" = 1 ]; then SSH_ROOT='prohibit-password'; SSH_PASS='no'
+    else SSH_WHY="running as root with no key in /root/.ssh/authorized_keys - turning root login off could lock you out"; fi
+  else
+    SSH_ROOT='no'
+    if [ "$HAS_KEY" = 1 ]; then SSH_PASS='no'
+    else SSH_WHY="no key in $KEY_HOME/.ssh/authorized_keys - password login will stay on"; fi
+  fi
+}
+ssh_plan_text() {
+  local t="root login off"
+  [ "$SSH_ROOT" = prohibit-password ] && t="root login by key only"
+  if [ "$SSH_PASS" = no ]; then echo "$t, password login off"
+  else echo "$t; password login kept, no key found"; fi
+}
+
+# Share credentials: from the environment, else asked, else refused.
+share_credentials() {
+  NAS_USER="${NAS_USER:-}"; NAS_PASS="${NAS_PASS:-}"
+  [ -n "$NAS_USER" ] && [ -n "$NAS_PASS" ] && return 0
+  [ -t 0 ] || die 'set NAS_USER and NAS_PASS in the environment to mount a share without a terminal'
+  if [ -z "$NAS_USER" ]; then read -r -p '    User: ' NAS_USER || NAS_USER=''; fi
+  if [ -z "$NAS_PASS" ]; then read -rs -p '    Password: ' NAS_PASS || NAS_PASS=''; echo; fi
+  if [ -z "$NAS_USER" ] || [ -z "$NAS_PASS" ]; then die 'the share needs a user and a password'; fi
+}
+
+#==============================================================================
+# Plan
+#==============================================================================
+show_system
+plan_ssh
+
+if [ "$SSHD" = 0 ]; then DO_HARDEN=no; fi
+if [ -z "$LV_PATH" ] || [ "$VG_FREE" -le 0 ]; then DO_EXTEND=no; fi
+if [ -n "$SHARE" ]; then parse_share "$SHARE" || die "share must look like //server/name, got '$SHARE'"; fi
+
+#--- Interactive --------------------------------------------------------------
+# Only when nothing was asked for and someone is there to answer. Each question
+# is preceded by one plain line saying what it changes. Answers go into ANS
+# rather than stdout, so a captured prompt never ends up in a value.
+ANS=''
+ask()    { local a; read -r -p "  $1" a || a=''; ANS="${a:-$2}"; }
+ask_yn() { local a d="$2" hint='[Y/n]'; [ "$d" = n ] && hint='[y/N]'
+           read -r -p "  $1 $hint " a || a=''
+           case "${a:-$d}" in [Yy]*) ANS=yes ;; *) ANS=no ;; esac; }
+hint()   { echo; note "$1"; }
+
+if [ "$GIVEN" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+  title 'Questions'
+  note 'press enter to accept the value in brackets'
+
+  hint 'Upgrades every installed package, then adds the usual tools: curl, git, htop, nano, tree.'
+  ask_yn 'Update the system and install base tools?' y; DO_UPDATE="$ANS"
+
+  hint 'Security fixes install on their own, once a day, without a reboot.'
+  ask_yn 'Enable automatic security updates?' y; DO_AUTO="$ANS"
+
+  hint 'The two folders where services and their data usually live. The owner can write there without sudo.'
+  if [ -n "$OWNER" ]; then
+    ask "Owner of /srv and /opt [$OWNER] (- for none): " "$OWNER"
+    [ "$ANS" = '-' ] && ANS=''
+  else
+    ask 'Owner of /srv and /opt (empty = none): ' ''
+  fi
+  OWNER="$ANS"
+
+  hint 'A folder from a NAS or another machine, mounted here and reconnected at every boot.'
+  ask_yn 'Mount a network share?' n
+  if [ "$ANS" = yes ]; then
+    while :; do
+      ask '  Share, e.g. //server/name: ' ''
+      if parse_share "$ANS"; then break; fi
+      warn "that does not look like //server/name"
+    done
+    ask "  Mount point [/mnt/$SHARE_SLUG]: " "/mnt/$SHARE_SLUG"; MOUNT="$ANS"
+    share_credentials
+    ask_yn '  Read-only?' n; SHARE_RO="$ANS"
+  fi
+
+  if ipv6_disabled; then DO_IPV6=no
+  else
+    hint 'Only if your network does not use IPv6. Removes a common source of slow lookups and odd delays.'
+    ask_yn 'Disable IPv6?' n; DO_IPV6="$ANS"
+  fi
+
+  if [ "$DO_EXTEND" = yes ]; then
+    hint 'The virtual disk is bigger than the root filesystem; the difference sits unused.'
+    ask_yn "Extend the root volume over the ${VG_FREE} GB free?" y; DO_EXTEND="$ANS"
+  fi
+
+  if [ "$SSHD" = 1 ]; then
+    if [ -n "$SSH_ROOT" ]; then
+      hint 'Closes SSH to root and, when your key is already installed, to passwords.'
+      ask_yn 'Harden SSH?' y; DO_HARDEN="$ANS"
+      [ "$DO_HARDEN" = yes ] && [ -n "$SSH_WHY" ] && warn "$SSH_WHY"
+    else
+      DO_HARDEN=no
+      hint "SSH not hardened: $SSH_WHY"
+    fi
+  fi
+fi
+
+#--- Resolve what was given without questions ---------------------------------
+if [ -n "$SHARE" ]; then
+  [ -n "$MOUNT" ] || MOUNT="/mnt/$SHARE_SLUG"
+  case "$MOUNT" in /*) ;; *) die "mount point must be an absolute path, got '$MOUNT'" ;; esac
+  share_credentials
+  CRED_FILE="/etc/cifs-${SHARE_SLUG}.cred"
+fi
+if [ -n "$OWNER" ] && ! id "$OWNER" >/dev/null 2>&1; then
+  warn "user $OWNER does not exist - /srv and /opt left alone"
+  OWNER=''
+fi
+if [ "$DO_HARDEN" = yes ] && [ -z "$SSH_ROOT" ]; then
+  [ "$SSHD" = 1 ] && warn "SSH not hardened: $SSH_WHY"
+  DO_HARDEN=no
+fi
+if [ "$DO_IPV6" = yes ] && ipv6_disabled; then DO_IPV6=no; fi
+
+DO_AGENT=no
+if [ "$AGENT_CHANNEL" = 1 ] && [ "$(agent_state)" != running ]; then DO_AGENT=yes; fi
+
+#--- To apply -----------------------------------------------------------------
+title 'To apply'
+TOTAL=0
+if [ "$DO_UPDATE" = yes ]; then
+  kv system "update, ${#BASE_PKGS[@]} base packages"; TOTAL=$((TOTAL + 1))
+fi
+[ "$DO_AUTO"   = yes ] && { kv 'auto-updates' 'security updates applied unattended'; TOTAL=$((TOTAL + 1)); }
+[ "$DO_AGENT"  = yes ] && { kv 'guest agent' 'installed and started'; TOTAL=$((TOTAL + 1)); }
+[ -n "$OWNER" ]        && { kv owner "$OWNER on /srv and /opt"; TOTAL=$((TOTAL + 1)); }
+if [ -n "$SHARE" ]; then
+  m='read-write'; [ "$SHARE_RO" = yes ] && m='read-only'
+  kv share "$SHARE on $MOUNT, $m, remounted at boot"; TOTAL=$((TOTAL + 1))
+fi
+[ "$DO_IPV6"   = yes ] && { kv ipv6 'disabled'; TOTAL=$((TOTAL + 1)); }
+[ "$DO_EXTEND" = yes ] && { kv 'root volume' "extended by ${VG_FREE} GB"; TOTAL=$((TOTAL + 1)); }
+[ "$DO_HARDEN" = yes ] && { kv ssh "$(ssh_plan_text)"; TOTAL=$((TOTAL + 1)); }
+[ "$TOTAL" -gt 0 ] || { note 'nothing to do'; echo; exit 0; }
+
+if [ "$DRY_RUN" = 1 ]; then echo; exit 0; fi
+if [ "$GIVEN" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+  echo; ask_yn "Apply these $(plural "$TOTAL" step)?" y
+  [ "$ANS" = yes ] || { note 'nothing changed'; echo; exit 0; }
+fi
+
+#==============================================================================
+# Apply
+#==============================================================================
+$SUDO touch "$LOG"; $SUDO chown "$(id -u)" "$LOG"; $SUDO chmod 600 "$LOG"
+LOG_READY=1
+log ""; log "##### vm-init $(date '+%F %T')"
+
+on_error() {
+  local c=$?
+  [ "$TTY" = 1 ] && printf '\r\033[K'
+  printf '%s└─ ✗ %s failed (exit %d)%s\n' "$E" "$CURRENT" "$c" "$R" >&2
+  printf '   last lines of %s:\n' "$LOG" >&2
+  tail -n 12 "$LOG" 2>/dev/null | sed 's/^/     /' >&2
+  exit "$c"
+}
+trap on_error ERR
+
+# Keep the sudo ticket alive through a long upgrade.
+KEEP=''
+if [ -n "$SUDO" ]; then
+  ( while kill -0 $$ 2>/dev/null; do sudo -n true 2>/dev/null || exit; sleep 50; done ) &
+  KEEP=$!
+fi
+trap '[ -n "$KEEP" ] && kill "$KEEP" 2>/dev/null; true' EXIT
+
+# apt with a live view: one tick per package configured, a spinner in between.
+apt_run() {   # apt_run <label> <apt-get arguments...>
+  local label="$1" tmp off=0 i=0 pid slice l p rc=0 cur; shift
+  cur="$label"
+  tmp="$(mktemp)"
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y \
+    -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@" >"$tmp" 2>&1 &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    slice="$(tail -n +$((off + 1)) "$tmp" 2>/dev/null || true)"
+    if [ -n "$slice" ]; then
+      off="$(wc -l <"$tmp")"
+      while IFS= read -r l; do
+        case "$l" in
+          'Setting up '*)         p="${l#Setting up }"; p="${p%% *}"; p="${p%%:*}"
+                                  [ "$TTY" = 1 ] && printf '\r\033[K'; tick "$p"; cur='configuring' ;;
+          'Unpacking '*)          p="${l#Unpacking }"; p="${p%% *}"; cur="unpacking ${p%%:*}" ;;
+          'Get:'*)                cur='downloading' ;;
+          'Processing triggers'*) cur='finishing' ;;
+        esac
+      done <<<"$slice"
+    fi
+    if [ "$TTY" = 1 ]; then
+      printf '\r\033[K%s│%s  %s%s%s %s' "$C" "$R" "$C" "${SPIN[i]}" "$R" "$cur"
+    fi
+    i=$(( (i + 1) % ${#SPIN[@]} )); sleep 0.1
+  done
+  [ "$TTY" = 1 ] && printf '\r\033[K'
+  wait "$pid" || rc=$?
+  cat "$tmp" >>"$LOG"; rm -f "$tmp"
+  return "$rc"
+}
+installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+# Install what a step needs even when the update step was declined.
+APT_UPDATED=0
+ensure_pkg() {
+  local p missing=()
+  for p in "$@"; do installed "$p" || missing+=("$p"); done
+  [ "${#missing[@]}" = 0 ] && return 0
+  [ "$APT_UPDATED" = 1 ] || { apt_run 'refreshing package lists' update; APT_UPDATED=1; }
+  apt_run "installing ${missing[*]}" install "${missing[@]}"
+}
+
+#--- system -------------------------------------------------------------------
+if [ "$DO_UPDATE" = yes ]; then
+  step 'System update'
+  apt_run 'refreshing package lists' update; APT_UPDATED=1
+  UPG="$(apt-get -s full-upgrade 2>/dev/null | grep -c '^Inst ' || true)"
+  NEW=0; for p in "${BASE_PKGS[@]}"; do installed "$p" || NEW=$((NEW + 1)); done
+  info "$(plural "$UPG" package) to upgrade, $(plural "$NEW" 'base tool') to install"
+  [ "$UPG" -gt 0 ] && apt_run 'upgrading' full-upgrade
+  [ "$NEW" -gt 0 ] && apt_run 'installing base tools' install "${BASE_PKGS[@]}"
+  ok "$(plural "$UPG" package) upgraded, $(plural "$NEW" tool) installed"
+fi
+
+#--- automatic updates --------------------------------------------------------
+if [ "$DO_AUTO" = yes ]; then
+  step 'Automatic updates'
+  ensure_pkg unattended-upgrades
+  $SUDO tee "$APT_CONF" >/dev/null <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+  info "$APT_CONF"
+  ok 'enabled, security fixes install on their own'
+fi
+
+#--- guest agent --------------------------------------------------------------
+if [ "$DO_AGENT" = yes ]; then
+  step 'Guest agent'
+  ensure_pkg qemu-guest-agent
+  busy 'starting qemu-guest-agent' $SUDO systemctl enable --now qemu-guest-agent || true
+  if [ "$(agent_state)" = running ]; then ok 'running, the hypervisor can see this VM'
+  else stop "installed but not running - systemctl status qemu-guest-agent"; fi
+elif [ "$VIRT" = kvm ] || [ "$VIRT" = qemu ]; then
+  if [ "$AGENT_CHANNEL" = 0 ]; then
+    warn "no guest agent channel - enable 'QEMU Guest Agent' in the VM options, then power the VM off and on"
+  fi
+fi
+
+#--- owner --------------------------------------------------------------------
+if [ -n "$OWNER" ]; then
+  step 'Owner of /srv and /opt'
+  OWNER_GROUP="$(id -gn "$OWNER")"
+  $SUDO mkdir -p /srv /opt
+  $SUDO chown -R "$OWNER:$OWNER_GROUP" /srv /opt
+  $SUDO chmod 2775 /srv /opt
+  info "owner $OWNER, group $OWNER_GROUP, new files inherit the group"
+  ok 'done'
+fi
+
+#--- share --------------------------------------------------------------------
+port_open() {   # up to five tries: a port that misses once is not closed
+  local _
+  for _ in 1 2 3 4 5; do
+    # shellcheck disable=SC2016  # $0 is expanded by the inner bash, on purpose
+    if timeout 3 bash -c 'exec 3<>"/dev/tcp/$0/445"' "$1" 2>/dev/null; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+if [ -n "$SHARE" ]; then
+  step 'Network share'
+  ensure_pkg cifs-utils
+  if ! busy "looking for $SHARE_SERVER on port 445" port_open "$SHARE_SERVER"; then
+    stop "$SHARE_SERVER does not answer on port 445 - nothing written, run again when it is up"
+  else
+    info "$SHARE_SERVER answers on port 445"
+    printf 'username=%s\npassword=%s\n' "$NAS_USER" "$NAS_PASS" | $SUDO tee "$CRED_FILE" >/dev/null
+    $SUDO chown root:root "$CRED_FILE"; $SUDO chmod 600 "$CRED_FILE"
+    info "credentials in $CRED_FILE, readable by root only"
+    opts="credentials=$CRED_FILE,file_mode=0644,dir_mode=0755,_netdev,nofail"
+    if [ -n "$OWNER" ]; then opts="$opts,uid=$(id -u "$OWNER"),gid=$(id -g "$OWNER")"; fi
+    m='read-write'; if [ "$SHARE_RO" = yes ]; then opts="$opts,ro"; m='read-only'; fi
+    $SUDO mkdir -p "$MOUNT"
+    $SUDO sed -i "\\| $MOUNT cifs |d" /etc/fstab
+    echo "$SHARE $MOUNT cifs $opts 0 0" | $SUDO tee -a /etc/fstab >/dev/null
+    info "/etc/fstab: $SHARE on $MOUNT, $m, mounted at every boot"
+    $SUDO systemctl daemon-reload >>"$LOG" 2>&1 || true
+    if mountpoint -q "$MOUNT"; then $SUDO umount "$MOUNT" >>"$LOG" 2>&1 || true; fi
+    if busy 'mounting' $SUDO mount "$MOUNT" && mountpoint -q "$MOUNT"; then
+      n="$(find "$MOUNT" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)"
+      ok "mounted, $(plural "$n" entry entries), $(df -h "$MOUNT" | awk 'NR == 2 { print $4 }') free"
+    else
+      stop "mount failed - check the user, the password and the share name (details in $LOG), then run again"
+    fi
+  fi
+fi
+
+#--- ipv6 ---------------------------------------------------------------------
+netplan_apply() {   # applying drops the link for a moment; wait for IPv4 to return
+  local _
+  $SUDO netplan apply
+  for _ in $(seq 1 30); do
+    if ip -4 addr show "$IFACE" 2>/dev/null | grep -q 'inet ' \
+       && ip route show default 2>/dev/null | grep -q .; then break; fi
+    sleep 0.5
+  done
+  for _ in 1 2 3 4 5 6; do
+    ip -6 addr show "$IFACE" 2>/dev/null | grep -q inet6 || break; sleep 0.5
+  done
+}
+if [ "$DO_IPV6" = yes ]; then
+  step 'IPv6'
+  $SUDO tee "$SYSCTL_CONF" >/dev/null <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+  $SUDO sysctl -q -p "$SYSCTL_CONF" >>"$LOG" 2>&1
+  info "$SYSCTL_CONF: off now and at every boot"
+  # Netplan (Ubuntu) would hand the address back at its next apply, so it is
+  # told too.
+  if command -v netplan >/dev/null 2>&1 && [ -d /etc/netplan ] && [ -n "$IFACE" ]; then
+    $SUDO tee "$NETPLAN_CONF" >/dev/null <<EOF
+network:
+  version: 2
+  ethernets:
+    $IFACE:
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+EOF
+    $SUDO chmod 600 "$NETPLAN_CONF"
+    info "$NETPLAN_CONF: no IPv6 on $IFACE"
+    busy 'applying netplan, the link blinks for a second' netplan_apply || true
+  fi
+  if [ -n "$IFACE" ] && ip -6 addr show "$IFACE" 2>/dev/null | grep -q inet6; then
+    stop "disabled, but an address remains on $IFACE - it goes at the next reboot"
+  else
+    ok "disabled${IFACE:+, no address left on $IFACE}"
+  fi
+fi
+
+#--- root volume --------------------------------------------------------------
+if [ "$DO_EXTEND" = yes ]; then
+  step 'Root volume'
+  before="$(df -h / | awk 'NR == 2 { print $2 }')"
+  info "$LV_PATH: adding the ${VG_FREE} GB left in the volume group"
+  busy 'growing the volume and its filesystem' $SUDO lvextend -r -l +100%FREE "$LV_PATH"
+  ok "root filesystem $before -> $(df -h / | awk 'NR == 2 { print $2 }')"
+fi
+
+#--- ssh ----------------------------------------------------------------------
+if [ "$DO_HARDEN" = yes ]; then
+  step 'SSH'
+  $SUDO mkdir -p "$(dirname "$SSHD_CONF")"
+  { echo "PermitRootLogin $SSH_ROOT"
+    [ "$SSH_PASS" = no ] && echo 'PasswordAuthentication no'
+    true
+  } | $SUDO tee "$SSHD_CONF" >/dev/null
+  info "$SSHD_CONF"
+  [ -d /run/sshd ] || $SUDO mkdir -p /run/sshd
+  if ! $SUDO sshd -t >>"$LOG" 2>&1; then
+    $SUDO rm -f "$SSHD_CONF"
+    die "sshd rejected the new config - nothing changed, details in $LOG"
+  fi
+  info 'config checked by sshd, service restarted'
+  $SUDO systemctl restart ssh >>"$LOG" 2>&1 || $SUDO systemctl restart sshd >>"$LOG" 2>&1
+  if [ "$SSH_PASS" = no ]; then ok "$(ssh_line)"
+  else stop "root login off; password login kept until a key is in $KEY_HOME/.ssh/authorized_keys"; fi
+fi
+
+#==============================================================================
+# Done
+#==============================================================================
+# Everything is applied. The summary only reads; nothing in it is an error.
+trap - ERR; set +e
+printf '\n%s' "$C"; printf '─%.0s' $(seq 1 62); printf '%s\n' "$R"
+printf '%sDone%s in %s, %s\n' "$B" "$R" "$(duration "$SECONDS")" "$(plural "$WARNINGS" warning)"
+if [ -n "$SHARE" ] && mountpoint -q "$MOUNT" 2>/dev/null; then
+  kv share "$MOUNT, $(df -h "$MOUNT" | awk 'NR == 2 { print $4 }') free"
+fi
+[ "$SSHD" = 1 ] && kv ssh "$(ssh_line)"
+[ -f /var/run/reboot-required ] && kv reboot 'required - sudo reboot'
+kv log "$LOG"
+if [ "$DO_HARDEN" = yes ] && [ "$SSH_PASS" != no ]; then
+  echo
+  warn "add a key to $KEY_HOME/.ssh/authorized_keys, then: vm-init --harden-ssh"
+fi
+
+# Offer the reboot, but only to someone who is there to answer: a script or
+# a provisioning tool decides that for itself.
+if [ -f /var/run/reboot-required ] && [ "$GIVEN" = 0 ] && [ "$ASSUME_YES" = 0 ] && [ -t 0 ]; then
+  hint 'The kernel or a core library was updated and only takes effect after a reboot.'
+  ask_yn 'Reboot now?' y
+  if [ "$ANS" = yes ]; then
+    printf '  rebooting\n\n'
+    $SUDO reboot
+    exit 0
+  fi
+fi
+echo
